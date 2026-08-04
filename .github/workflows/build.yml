@@ -1,0 +1,103 @@
+name: Build kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+          description: 'Upload release'
+          type: boolean
+          required: true
+          default: false
+      changelog:
+          description: 'Changelog'
+          type: string
+          required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout repository with submodules (shallow clone)
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Install build tools and AArch64 cross-compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            python-is-python3 \
+            git curl unzip wget zip zstd libssl-dev bison flex
+
+          # Symlink pentru apelurile care caută 'python2'
+          if ! command -v python2 &> /dev/null; then
+            sudo ln -s $(which python3) /usr/local/bin/python2
+          fi
+      # Compilăm DTC-ul modern ÎNAINTE ca scriptul build.sh să pornească
+      - name: "Build New DTC"
+        run: |
+          git clone --depth=1 https://git.kernel.org/pub/scm/utils/dtc/dtc.git
+          cd dtc
+          make -j$(nproc)
+          echo "$(pwd)" >> $GITHUB_PATH
+
+      - name: Download prebuilt Google clang
+        run: |
+          wget -O llvm.tar.zst https://github.com/Ylarod/setup-ndk-clang/releases/download/prebuilt/clang-linux-x86-ndk-r29-r563880c.tar.zst
+          mkdir llvm-21; cd llvm-21
+          tar -I unzstd -xf ../llvm.tar.zst
+          rm ../llvm.tar.zst
+          cd ..
+
+      # 2. Run your custom bash script
+      - name: Build kernel
+        run: |
+          chmod +x build.sh
+          bash build.sh
+
+      - name: Package with AnyKernel3
+        run: |
+          # 1. Clonăm AnyKernel3
+          git clone https://github.com/osm0sis/AnyKernel3.git AnyKernel
+          rm -rf AnyKernel/.git
+
+          # 2. Căutăm imaginea principală (Image) și fișierul DTB
+          NEW_IMAGE=$(find out/ -name "Image" -path "*/arch/arm64/boot/Image" | head -n 1)
+          NEW_DTB=$(find out/ -name "dtb" -path "*/arch/arm64/boot/dts/dtb" | head -n 1)
+
+          if [ -z "$NEW_IMAGE" ]; then
+            echo "EROARE CRITICĂ: Lipsește fișierul Image!"
+            exit 1
+          fi
+
+          # 3. Copiem Kernel Image, DTB, DTBO și BOOT.IMG în folderul AnyKernel3
+          cp "$NEW_IMAGE" AnyKernel/Image
+          [ -f "$NEW_DTB" ] && cp "$NEW_DTB" AnyKernel/dtb
+          [ -f "dtbo.img" ] && cp "dtbo.img" AnyKernel/dtbo.img
+          [ -f "boot.img" ] && cp "boot.img" AnyKernel/boot.img
+
+          # 4. Copiem modulele kernel (.ko) dacă există
+          mkdir -p AnyKernel/modules/system/lib/modules
+          find out/ -name "*.ko" -exec cp {} AnyKernel/modules/system/lib/modules/ \;
+
+          # 5. Configurăm anykernel.sh pentru Samsung S10 Lite (r5q)
+          cd AnyKernel
+          sed -i 's/device.name1=.*/device.name1=r5q/g' anykernel.sh
+          sed -i 's/device.name2=.*/device.name2=r5qxx/g' anykernel.sh
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+
+          # Împachetăm zip-ul final cu toate fișierele (Image, dtb, dtbo.img, boot.img)
+          zip -r9 ../AnyKernel3-S10Lite-r5q.zip *
+          cd ..
+
+      - name: Upload Flashable AnyKernel3 Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: S10Lite-AnyKernel3-Flashable
+          path: AnyKernel3-S10Lite-r5q.zip
